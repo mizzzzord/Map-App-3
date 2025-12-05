@@ -1,40 +1,172 @@
+import { LocationObject } from 'expo-location';
 import { useRouter } from 'expo-router';
-import React, { useState } from 'react';
-import { Alert, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
-import MapView, { LongPressEvent, Marker as MapMarker, PROVIDER_DEFAULT } from 'react-native-maps';
+import React, { useCallback, useEffect, useState } from 'react';
+import { ActivityIndicator, Alert, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
+import Map from '../components/Map';
 import { useDatabase } from '../contexts/DatabaseContext';
+import { LocationService } from '../services/location';
+import { NotificationManager } from '../services/notifications';
+
+// Порог расстояния для уведомлений (в метрах)
+const PROXIMITY_THRESHOLD = 20;
 
 export default function MapScreen() {
   const router = useRouter();
   const { markers, addMarker, deleteMarker, isLoading } = useDatabase();
   const [selectedMarker, setSelectedMarker] = useState<any>(null);
   const [isAddingMarker, setIsAddingMarker] = useState(false);
+  const [userLocation, setUserLocation] = useState<LocationObject | null>(null);
+  const [locationError, setLocationError] = useState<string | null>(null);
+  const [isLocationLoading, setIsLocationLoading] = useState(true);
+  const [lastCheckedLocation, setLastCheckedLocation] = useState<LocationObject | null>(null);
 
-  const handleMapLongPress = async (event: LongPressEvent) => {
+  const notificationManager = NotificationManager.getInstance();
+
+  // Инициализация отслеживания местоположения
+  useEffect(() => {
+    let isMounted = true;
+    
+    const initLocationTracking = async () => {
+      try {
+        console.log('🚀 Запускаем отслеживание местоположения...');
+        setIsLocationLoading(true);
+
+        // Запрашиваем разрешения
+        const hasPermission = await LocationService.requestLocationPermissions();
+        if (!hasPermission) {
+          throw new Error('Разрешение на геолокацию не получено');
+        }
+
+        // Получаем текущую позицию
+        const currentLocation = await LocationService.getCurrentPositionAsync();
+        if (isMounted && currentLocation) {
+          setUserLocation(currentLocation);
+          setLastCheckedLocation(currentLocation);
+          console.log('📍 Начальная позиция получена');
+          
+          // Сразу проверяем метки
+          checkProximityToMarkers(currentLocation);
+        }
+
+        // Запускаем постоянное отслеживание
+        const subscription = await LocationService.startLocationUpdates(
+          (location) => {
+            if (isMounted) {
+              setUserLocation(location);
+              
+              // Проверяем метки при значительном перемещении
+              if (shouldCheckLocation(location)) {
+                setLastCheckedLocation(location);
+                checkProximityToMarkers(location);
+              }
+            }
+          }
+        );
+
+        if (isMounted && subscription) {
+          console.log('✅ Отслеживание активно');
+        }
+
+      } catch (error) {
+        console.error('❌ Ошибка инициализации:', error);
+        if (isMounted) {
+          setLocationError('Не удалось запустить геолокацию');
+        }
+      } finally {
+        if (isMounted) {
+          setIsLocationLoading(false);
+        }
+      }
+    };
+
+    initLocationTracking();
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  // Определяем, нужно ли проверять метки для новой позиции
+  const shouldCheckLocation = (newLocation: LocationObject): boolean => {
+    if (!lastCheckedLocation) return true;
+    
+    const distance = LocationService.calculateDistance(
+      lastCheckedLocation.coords.latitude,
+      lastCheckedLocation.coords.longitude,
+      newLocation.coords.latitude,
+      newLocation.coords.longitude
+    );
+    
+    return distance >= 2; // Проверяем если переместились на 2+ метра
+  };
+
+  // Проверка приближения к меткам
+  const checkProximityToMarkers = useCallback((location: LocationObject) => {
+    if (markers.length === 0) {
+      console.log('📭 Нет меток для проверки');
+      return;
+    }
+
+    console.log(`\n📍 ПРОВЕРКА МЕТОК (${markers.length} шт.)`);
+    console.log(`📱 Моя позиция: ${location.coords.latitude.toFixed(6)}, ${location.coords.longitude.toFixed(6)}`);
+
+    let nearMarkersCount = 0;
+
+    markers.forEach(marker => {
+      const distance = LocationService.calculateDistance(
+        location.coords.latitude,
+        location.coords.longitude,
+        marker.latitude,
+        marker.longitude
+      );
+
+      console.log(`📏 "${marker.title}": ${distance.toFixed(1)}м`);
+
+      if (distance <= PROXIMITY_THRESHOLD) {
+        nearMarkersCount++;
+        console.log(`🎯 НАХОДИТСЯ В РАДИУСЕ ${PROXIMITY_THRESHOLD}м!`);
+        notificationManager.showNotification(marker);
+      }
+    });
+
+    if (nearMarkersCount > 0) {
+      console.log(`✅ Найдено ${nearMarkersCount} меток рядом`);
+    } else {
+      console.log('❌ Рядом нет меток');
+    }
+  }, [markers]);
+
+  const handleMapLongPress = async (event: any) => {
     if (isAddingMarker) return;
     
     const { coordinate } = event.nativeEvent;
     setIsAddingMarker(true);
     
     try {
-      console.log('🔄 Начало добавления маркера...');
+      console.log('🔄 Создаем новую метку...');
       
-      // Добавляем маркер и ЖДЕМ завершения
-      await addMarker(
+      const newMarkerId = await addMarker(
         coordinate.latitude, 
         coordinate.longitude, 
         `Метка ${markers.length + 1}`
       );
 
-      console.log('✅ Маркер успешно добавлен в состояние');
+      console.log('✅ Метка создана, ID:', newMarkerId);
       
+      // Сразу проверяем, не рядом ли мы с новой меткой
+      if (userLocation) {
+        setTimeout(() => {
+          checkProximityToMarkers(userLocation);
+        }, 1000);
+      }
+
       Alert.alert(
-        'Метка добавлена', 
-        `Метка создана в точке: ${coordinate.latitude.toFixed(4)}, ${coordinate.longitude.toFixed(4)}`,
+        '✅ Метка добавлена', 
+        `Создана метка в точке:\n${coordinate.latitude.toFixed(6)}, ${coordinate.longitude.toFixed(6)}`,
         [{ text: 'OK' }]
       );
     } catch (error) {
-      console.error('❌ Ошибка добавления маркера:', error);
+      console.error('❌ Ошибка создания метки:', error);
       Alert.alert('Ошибка', 'Не удалось добавить метку');
     } finally {
       setIsAddingMarker(false);
@@ -43,6 +175,7 @@ export default function MapScreen() {
 
   const handleMarkerPress = (marker: any) => {
     setSelectedMarker(marker);
+    console.log(`📍 Выбрана метка: "${marker.title}"`);
   };
 
   const handleMarkerCalloutPress = (marker: any) => {
@@ -62,7 +195,7 @@ export default function MapScreen() {
 
     Alert.alert(
       'Удалить метку',
-      `Вы уверены, что хотите удалить метку "${selectedMarker.title || 'Метка'}"?`,
+      `Удалить метку "${selectedMarker.title || 'Метка'}"?`,
       [
         { text: 'Отмена', style: 'cancel' },
         {
@@ -82,60 +215,89 @@ export default function MapScreen() {
     );
   };
 
-  if (isLoading && markers.length === 0) {
+  const testNotification = async () => {
+    console.log('🔔 ЗАПУСК ТЕСТА УВЕДОМЛЕНИЙ...');
+    await notificationManager.testNotification();
+  };
+
+  const forceCheckMarkers = () => {
+    if (userLocation) {
+      console.log('🔍 ПРИНУДИТЕЛЬНАЯ ПРОВЕРКА МЕТОК...');
+      checkProximityToMarkers(userLocation);
+    } else {
+      Alert.alert('Ошибка', 'Местоположение не определено');
+    }
+  };
+
+  if (isLoading) {
     return (
       <View style={styles.loadingContainer}>
-        <Text>Загрузка карты...</Text>
+        <ActivityIndicator size="large" color="#007AFF" />
+        <Text style={styles.loadingText}>Загрузка карты...</Text>
       </View>
     );
   }
 
   return (
     <View style={styles.container}>
-      <MapView
-        style={styles.map}
-        provider={PROVIDER_DEFAULT}
-        initialRegion={{
-          latitude: 58.0105,
-          longitude: 56.2502,
-          latitudeDelta: 0.0922,
-          longitudeDelta: 0.0421,
-        }}
+      <Map
+        markers={markers}
+        onMarkerPress={handleMarkerPress}
         onLongPress={handleMapLongPress}
-      >
-        {markers.map(marker => (
-          <MapMarker
-            key={marker.id}
-            coordinate={{
-              latitude: marker.latitude,
-              longitude: marker.longitude,
-            }}
-            title={marker.title || 'Метка'}
-            description="Нажмите для действий"
-            onPress={() => handleMarkerPress(marker)}
-            onCalloutPress={() => handleMarkerCalloutPress(marker)}
-          />
-        ))}
-      </MapView>
+        userLocation={userLocation ? {
+          latitude: userLocation.coords.latitude,
+          longitude: userLocation.coords.longitude
+        } : null}
+      />
 
-      {/* Информация о количестве маркеров */}
+      {/* Информационная панель */}
       <View style={styles.infoPanel}>
-        <Text style={styles.infoTitle}>Карта Перми</Text>
+        <Text style={styles.infoTitle}>🗺️ Карта меток</Text>
         <Text style={styles.infoText}>
-          Количество меток: {markers.length}
+          Меток: {markers.length} | Радиус: {PROXIMITY_THRESHOLD}м
         </Text>
+        
+        {/* Статус местоположения */}
+        <View style={styles.statusContainer}>
+          {isLocationLoading ? (
+            <>
+              <ActivityIndicator size="small" color="#007AFF" />
+              <Text style={styles.statusText}>Определяем местоположение...</Text>
+            </>
+          ) : locationError ? (
+            <Text style={styles.errorText}>❌ {locationError}</Text>
+          ) : userLocation ? (
+            <Text style={styles.successText}>📍 Геолокация активна</Text>
+          ) : (
+            <Text style={styles.warningText}>⚠️ Местоположение недоступно</Text>
+          )}
+        </View>
+
         <Text style={styles.helpText}>
-          {isAddingMarker ? 'Добавляем метку...' : 'Нажмите и удерживайте на карте чтобы добавить метку'}
+          {isAddingMarker ? '🔄 Создаем метку...' : '📍 Долгое нажатие - добавить метку'}
         </Text>
-        <Text style={styles.helpText}>
-          Нажмите на метку для действий
-        </Text>
+
+        {/* Кнопки тестирования */}
+        <View style={styles.testButtons}>
+          <TouchableOpacity 
+            style={styles.testButton} 
+            onPress={testNotification}
+          >
+            <Text style={styles.testButtonText}>🔔 Тест уведомления</Text>
+          </TouchableOpacity>
+          <TouchableOpacity 
+            style={styles.checkButton} 
+            onPress={forceCheckMarkers}
+          >
+            <Text style={styles.checkButtonText}>🔍 Проверить метки</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
-      {/* Кнопка удаления выбранной метки */}
+      {/* Панель действий для выбранной метки */}
       {selectedMarker && (
         <View style={styles.actionPanel}>
-          <Text style={styles.actionTitle}>Выбрана метка: {selectedMarker.title || 'Метка'}</Text>
+          <Text style={styles.actionTitle}>📍 {selectedMarker.title || 'Метка'}</Text>
           <View style={styles.actionButtons}>
             <TouchableOpacity 
               style={styles.detailsButton} 
@@ -160,16 +322,12 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
   },
-  map: {
-    width: '100%',
-    height: '100%',
-  },
   infoPanel: {
     position: 'absolute',
     top: 50,
     left: 20,
     right: 20,
-    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    backgroundColor: 'rgba(255, 255, 255, 0.98)',
     padding: 15,
     borderRadius: 12,
     shadowColor: '#000',
@@ -177,31 +335,91 @@ const styles = StyleSheet.create({
     shadowOpacity: 0.25,
     shadowRadius: 3.84,
     elevation: 5,
-    alignItems: 'center',
   },
   infoTitle: {
     fontSize: 18,
     fontWeight: 'bold',
     color: '#333',
     marginBottom: 5,
+    textAlign: 'center',
   },
   infoText: {
     fontSize: 14,
     color: '#666',
-    marginBottom: 5,
+    marginBottom: 8,
+    textAlign: 'center',
+  },
+  statusContainer: {
+    marginBottom: 8,
+    alignItems: 'center',
+  },
+  statusText: {
+    fontSize: 12,
+    color: '#666',
+    marginTop: 4,
+  },
+  successText: {
+    fontSize: 12,
+    color: '#34C759',
+    fontWeight: '500',
+  },
+  errorText: {
+    fontSize: 12,
+    color: '#FF3B30',
+    fontWeight: '500',
+    textAlign: 'center',
+  },
+  warningText: {
+    fontSize: 12,
+    color: '#FF9500',
+    fontWeight: '500',
   },
   helpText: {
     fontSize: 12,
     color: '#888',
     textAlign: 'center',
     fontStyle: 'italic',
+    marginBottom: 8,
+  },
+  testButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginTop: 5,
+  },
+  testButton: {
+    backgroundColor: '#FF9500',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 6,
+    flex: 1,
+    marginRight: 5,
+    alignItems: 'center',
+  },
+  testButtonText: {
+    color: 'white',
+    fontWeight: '600',
+    fontSize: 12,
+  },
+  checkButton: {
+    backgroundColor: '#007AFF',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 6,
+    flex: 1,
+    marginLeft: 5,
+    alignItems: 'center',
+  },
+  checkButtonText: {
+    color: 'white',
+    fontWeight: '600',
+    fontSize: 12,
   },
   actionPanel: {
     position: 'absolute',
     bottom: 20,
     left: 20,
     right: 20,
-    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    backgroundColor: 'rgba(255, 255, 255, 0.98)',
     padding: 15,
     borderRadius: 12,
     shadowColor: '#000',
@@ -253,5 +471,11 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
+    backgroundColor: '#f5f5f5',
+  },
+  loadingText: {
+    marginTop: 12,
+    fontSize: 16,
+    color: '#666',
   },
 });
